@@ -21,6 +21,27 @@ extern bool isLocationConfigured();
 extern void saveLocation(float lat, float lon);
 extern void showFlightUI();
 
+// External schedule/NTP functions (defined in main.cpp)
+struct ScheduleConfig {
+    char timezone[64];
+    bool enabled;
+    uint8_t daytime_start;
+    uint8_t daytime_end;
+    uint8_t dim_end;
+    uint8_t daytime_brightness;
+    uint8_t dim_brightness;
+};
+extern ScheduleConfig& getScheduleConfig();
+extern void saveScheduleConfig();
+extern void updateTimezone();
+extern void setBacklightBrightness(uint8_t percent);
+extern bool isNtpSynced();
+extern String getCurrentTimeString();
+extern int getCurrentHour();
+enum DisplayMode { MODE_DAYTIME, MODE_DIM, MODE_OFF };
+extern DisplayMode getCurrentDisplayMode();
+extern void reapplyCurrentBrightness();
+
 // Global instance
 DisplayWebServer webServer;
 
@@ -365,6 +386,126 @@ void DisplayWebServer::setupRoutes() {
             request->send(200, "application/json", responseStr);
         }
     );
+
+    // API: Get schedule configuration
+    server.on("/api/schedule", HTTP_GET, [](AsyncWebServerRequest *request) {
+        ScheduleConfig& cfg = getScheduleConfig();
+
+        StaticJsonDocument<512> doc;
+        doc["enabled"] = cfg.enabled;
+        doc["timezone"] = cfg.timezone;
+        doc["daytime_start"] = cfg.daytime_start;
+        doc["daytime_end"] = cfg.daytime_end;
+        doc["dim_end"] = cfg.dim_end;
+        doc["daytime_brightness"] = cfg.daytime_brightness;
+        doc["dim_brightness"] = cfg.dim_brightness;
+        doc["ntp_synced"] = isNtpSynced();
+        doc["current_time"] = getCurrentTimeString();
+        doc["current_hour"] = getCurrentHour();
+
+        const char* modeStr = "daytime";
+        DisplayMode mode = getCurrentDisplayMode();
+        if (mode == MODE_DIM) modeStr = "dim";
+        else if (mode == MODE_OFF) modeStr = "off";
+        doc["current_mode"] = modeStr;
+
+        String response;
+        serializeJson(doc, response);
+        request->send(200, "application/json", response);
+    });
+
+    // API: Set schedule configuration (with body handler for POST data)
+    server.on("/api/schedule", HTTP_POST,
+        [](AsyncWebServerRequest *request) {
+            // Response is sent after body is processed
+        },
+        NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            StaticJsonDocument<512> doc;
+            DeserializationError error = deserializeJson(doc, data, len);
+
+            if (error) {
+                request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+                return;
+            }
+
+            ScheduleConfig& cfg = getScheduleConfig();
+
+            // Update fields if provided
+            if (doc.containsKey("enabled")) {
+                cfg.enabled = doc["enabled"].as<bool>();
+            }
+            if (doc.containsKey("timezone")) {
+                strncpy(cfg.timezone, doc["timezone"].as<const char*>(), sizeof(cfg.timezone) - 1);
+                updateTimezone();
+            }
+            if (doc.containsKey("daytime_start")) {
+                cfg.daytime_start = doc["daytime_start"].as<uint8_t>();
+            }
+            if (doc.containsKey("daytime_end")) {
+                cfg.daytime_end = doc["daytime_end"].as<uint8_t>();
+            }
+            if (doc.containsKey("dim_end")) {
+                cfg.dim_end = doc["dim_end"].as<uint8_t>();
+            }
+            if (doc.containsKey("daytime_brightness")) {
+                cfg.daytime_brightness = doc["daytime_brightness"].as<uint8_t>();
+            }
+            if (doc.containsKey("dim_brightness")) {
+                cfg.dim_brightness = doc["dim_brightness"].as<uint8_t>();
+            }
+
+            // Save to NVS
+            saveScheduleConfig();
+
+            // Immediately apply brightness for current mode
+            reapplyCurrentBrightness();
+
+            StaticJsonDocument<128> response;
+            response["success"] = true;
+            response["message"] = "Schedule saved";
+
+            String responseStr;
+            serializeJson(response, responseStr);
+            request->send(200, "application/json", responseStr);
+        }
+    );
+
+    // API: Test brightness (manual brightness control)
+    server.on("/api/brightness", HTTP_POST,
+        [](AsyncWebServerRequest *request) {
+            // Response is sent after body is processed
+        },
+        NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            StaticJsonDocument<64> doc;
+            DeserializationError error = deserializeJson(doc, data, len);
+
+            if (error) {
+                request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+                return;
+            }
+
+            if (!doc.containsKey("brightness")) {
+                request->send(400, "application/json", "{\"error\":\"brightness required\"}");
+                return;
+            }
+
+            uint8_t brightness = doc["brightness"].as<uint8_t>();
+            if (brightness > 100) brightness = 100;
+
+            setBacklightBrightness(brightness);
+
+            StaticJsonDocument<64> response;
+            response["success"] = true;
+            response["brightness"] = brightness;
+
+            String responseStr;
+            serializeJson(response, responseStr);
+            request->send(200, "application/json", responseStr);
+        }
+    );
+
 }
 
 String DisplayWebServer::getIndexPage() {
@@ -514,6 +655,74 @@ String DisplayWebServer::getIndexPage() {
                 <input type="password" id="wifi-password" placeholder="Password (leave empty for open networks)">
             </div>
             <button class="btn" onclick="connectWifi()">Save & Connect</button>
+        </div>
+
+        <div class="card">
+            <h2>Display Schedule</h2>
+            <div id="schedule-status" style="margin-bottom: 15px;"></div>
+            <p style="color: #888; margin-bottom: 15px; font-size: 0.9em;">
+                Automatically adjust screen brightness based on time of day. Screen turns off during off hours to save power.
+            </p>
+
+            <div class="form-group">
+                <label style="display: flex; align-items: center; gap: 10px; cursor: pointer;">
+                    <input type="checkbox" id="schedule-enabled" style="width: auto;">
+                    <span>Enable display schedule</span>
+                </label>
+            </div>
+
+            <div class="form-group">
+                <label>Timezone</label>
+                <select id="schedule-timezone">
+                    <option value="UTC0">UTC</option>
+                    <option value="EST5EDT,M3.2.0,M11.1.0">Eastern (ET)</option>
+                    <option value="CST6CDT,M3.2.0,M11.1.0">Central (CT)</option>
+                    <option value="MST7MDT,M3.2.0,M11.1.0">Mountain (MT)</option>
+                    <option value="MST7">Arizona (no DST)</option>
+                    <option value="PST8PDT,M3.2.0,M11.1.0">Pacific (PT)</option>
+                    <option value="AKST9AKDT,M3.2.0,M11.1.0">Alaska (AKT)</option>
+                    <option value="HST10">Hawaii (HST)</option>
+                    <option value="GMT0BST,M3.5.0/1,M10.5.0">UK (GMT/BST)</option>
+                    <option value="CET-1CEST,M3.5.0,M10.5.0/3">Central Europe (CET)</option>
+                </select>
+            </div>
+
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 15px;">
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label>Daytime starts</label>
+                    <select id="schedule-daytime-start"></select>
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label>Dim starts</label>
+                    <select id="schedule-daytime-end"></select>
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label>Off starts</label>
+                    <select id="schedule-dim-end"></select>
+                </div>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label>Daytime brightness (%)</label>
+                    <input type="number" id="schedule-day-brightness" min="10" max="100" value="100">
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label>Dim brightness (%)</label>
+                    <input type="number" id="schedule-dim-brightness" min="10" max="100" value="50">
+                </div>
+            </div>
+
+            <div style="margin-bottom: 15px;">
+                <button class="btn" onclick="saveSchedule()">Save Schedule</button>
+            </div>
+
+            <div style="border-top: 1px solid #0f3460; padding-top: 15px;">
+                <p style="color: #888; margin-bottom: 10px; font-size: 0.9em;">Backlight control:</p>
+                <button class="btn btn-secondary" onclick="testBrightness(100)">On</button>
+                <button class="btn btn-secondary" onclick="testBrightness(0)">Off</button>
+                <p style="color: #666; margin-top: 10px; font-size: 0.8em;">Note: This display only supports on/off backlight control.</p>
+            </div>
         </div>
 
         <div class="card">
@@ -791,13 +1000,103 @@ String DisplayWebServer::getIndexPage() {
             }
         }
 
+        // Schedule functions
+        function initScheduleSelects() {
+            // Populate hour selects
+            const hourSelects = ['schedule-daytime-start', 'schedule-daytime-end', 'schedule-dim-end'];
+            hourSelects.forEach(id => {
+                const select = document.getElementById(id);
+                for (let h = 0; h < 24; h++) {
+                    const opt = document.createElement('option');
+                    opt.value = h;
+                    const ampm = h < 12 ? 'AM' : 'PM';
+                    const hour12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
+                    opt.textContent = `${hour12}:00 ${ampm}`;
+                    select.appendChild(opt);
+                }
+            });
+        }
+
+        async function loadScheduleStatus() {
+            try {
+                const response = await fetch('/api/schedule');
+                const data = await response.json();
+
+                const status = document.getElementById('schedule-status');
+                if (data.ntp_synced) {
+                    const modeColors = { daytime: 'success', dim: 'success', off: 'error' };
+                    status.innerHTML = `<span class="status status-${modeColors[data.current_mode]}">Current time: ${data.current_time} | Mode: ${data.current_mode}</span>`;
+                } else {
+                    status.innerHTML = `<span class="status status-error">Waiting for NTP sync...</span>`;
+                }
+
+                // Populate form fields
+                document.getElementById('schedule-enabled').checked = data.enabled;
+                document.getElementById('schedule-timezone').value = data.timezone;
+                document.getElementById('schedule-daytime-start').value = data.daytime_start;
+                document.getElementById('schedule-daytime-end').value = data.daytime_end;
+                document.getElementById('schedule-dim-end').value = data.dim_end;
+                document.getElementById('schedule-day-brightness').value = data.daytime_brightness;
+                document.getElementById('schedule-dim-brightness').value = data.dim_brightness;
+            } catch (e) {
+                console.error('Failed to load schedule:', e);
+            }
+        }
+
+        async function saveSchedule() {
+            const config = {
+                enabled: document.getElementById('schedule-enabled').checked,
+                timezone: document.getElementById('schedule-timezone').value,
+                daytime_start: parseInt(document.getElementById('schedule-daytime-start').value),
+                daytime_end: parseInt(document.getElementById('schedule-daytime-end').value),
+                dim_end: parseInt(document.getElementById('schedule-dim-end').value),
+                daytime_brightness: parseInt(document.getElementById('schedule-day-brightness').value),
+                dim_brightness: parseInt(document.getElementById('schedule-dim-brightness').value)
+            };
+
+            try {
+                const response = await fetch('/api/schedule', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    const status = document.getElementById('schedule-status');
+                    status.innerHTML = `<span class="status status-success">Schedule saved!</span>`;
+                    setTimeout(loadScheduleStatus, 2000);
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            } catch (e) {
+                console.error('Failed to save schedule:', e);
+                alert('Failed to save schedule');
+            }
+        }
+
+        async function testBrightness(level) {
+            try {
+                await fetch('/api/brightness', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ brightness: level })
+                });
+            } catch (e) {
+                console.error('Failed to set brightness:', e);
+            }
+        }
+
         // Load data on page load
         loadDeviceInfo();
         loadWifiStatus();
         initLocationMap();
         loadLocationStatus();
+        initScheduleSelects();
+        loadScheduleStatus();
         setInterval(loadDeviceInfo, 5000);
         setInterval(loadWifiStatus, 10000);
+        setInterval(loadScheduleStatus, 5000);  // Update time display
 
         // Check for existing screenshot
         fetch('/api/screenshot/status')

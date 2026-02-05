@@ -11,6 +11,8 @@
 #include "screenshot.h"
 #include <ElegantOTA.h>
 #include <math.h>
+#include <time.h>
+#include <esp_task_wdt.h>
 
 // Custom Space Grotesk fonts (compiled separately)
 LV_FONT_DECLARE(space_grotesk_bold_48);
@@ -40,6 +42,42 @@ bool locationConfigured = false;
 
 // Bounding box for API query (degrees around user location)
 #define BBOX_RANGE 2.0
+
+// ============================================================================
+// PWM BACKLIGHT CONFIGURATION
+// ============================================================================
+
+
+// ============================================================================
+// DISPLAY SCHEDULE CONFIGURATION
+// ============================================================================
+
+struct ScheduleConfig {
+    char timezone[64] = "MST7MDT,M3.2.0,M11.1.0";  // Mountain Time with DST
+    bool enabled = false;
+    uint8_t daytime_start = 7;     // 7 AM
+    uint8_t daytime_end = 21;      // 9 PM
+    uint8_t dim_end = 23;          // 11 PM (off is 11PM-7AM)
+    uint8_t daytime_brightness = 100;
+    uint8_t dim_brightness = 50;   // Testing with lower freq PWM
+};
+
+ScheduleConfig scheduleConfig;
+enum DisplayMode { MODE_DAYTIME, MODE_DIM, MODE_OFF };
+DisplayMode currentDisplayMode = MODE_DAYTIME;
+bool ntpSynced = false;
+unsigned long lastNtpCheck = 0;
+unsigned long lastScheduleCheck = 0;
+
+// Forward declaration for PWM backlight function
+void setBacklightBrightness(uint8_t percent);
+
+// ============================================================================
+// WATCHDOG TIMER CONFIGURATION
+// ============================================================================
+
+const uint32_t WDT_TIMEOUT_SECONDS = 300;  // 5 minutes
+bool watchdogEnabled = false;
 
 // ============================================================================
 // PIN DEFINITIONS for Guition ESP32-S3-4848S040
@@ -367,6 +405,174 @@ float getUserLat() { return userLat; }
 float getUserLon() { return userLon; }
 bool isLocationConfigured() { return locationConfigured; }
 
+// ============================================================================
+// SCHEDULE MANAGEMENT
+// ============================================================================
+
+Preferences schedule_prefs;
+
+void loadScheduleConfig() {
+    schedule_prefs.begin("schedule", true);  // read-only
+
+    String tz = schedule_prefs.getString("tz", "MST7MDT,M3.2.0,M11.1.0");
+    strncpy(scheduleConfig.timezone, tz.c_str(), sizeof(scheduleConfig.timezone) - 1);
+
+    scheduleConfig.enabled = schedule_prefs.getBool("enabled", false);
+    scheduleConfig.daytime_start = schedule_prefs.getUChar("day_start", 7);
+    scheduleConfig.daytime_end = schedule_prefs.getUChar("day_end", 21);
+    scheduleConfig.dim_end = schedule_prefs.getUChar("dim_end", 23);
+    scheduleConfig.daytime_brightness = schedule_prefs.getUChar("day_bright", 100);
+    scheduleConfig.dim_brightness = schedule_prefs.getUChar("dim_bright", 50);
+
+    schedule_prefs.end();
+
+    Serial.printf("Schedule loaded: enabled=%d, tz=%s\n", scheduleConfig.enabled, scheduleConfig.timezone);
+}
+
+void saveScheduleConfig() {
+    schedule_prefs.begin("schedule", false);  // read-write
+
+    schedule_prefs.putString("tz", scheduleConfig.timezone);
+    schedule_prefs.putBool("enabled", scheduleConfig.enabled);
+    schedule_prefs.putUChar("day_start", scheduleConfig.daytime_start);
+    schedule_prefs.putUChar("day_end", scheduleConfig.daytime_end);
+    schedule_prefs.putUChar("dim_end", scheduleConfig.dim_end);
+    schedule_prefs.putUChar("day_bright", scheduleConfig.daytime_brightness);
+    schedule_prefs.putUChar("dim_bright", scheduleConfig.dim_brightness);
+
+    schedule_prefs.end();
+
+    Serial.println("Schedule config saved");
+}
+
+ScheduleConfig& getScheduleConfig() { return scheduleConfig; }
+
+// ============================================================================
+// NTP TIME SYNC
+// ============================================================================
+
+void setupNTP() {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    setenv("TZ", scheduleConfig.timezone, 1);
+    tzset();
+    Serial.printf("NTP initialized with timezone: %s\n", scheduleConfig.timezone);
+}
+
+void updateTimezone() {
+    setenv("TZ", scheduleConfig.timezone, 1);
+    tzset();
+    Serial.printf("Timezone updated to: %s\n", scheduleConfig.timezone);
+}
+
+bool isNtpSynced() {
+    time_t now;
+    time(&now);
+    return now > 1577836800;  // After Jan 1, 2020
+}
+
+int getCurrentHour() {
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    return timeinfo.tm_hour;
+}
+
+String getCurrentTimeString() {
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%I:%M:%S %p", &timeinfo);
+    return String(buf);
+}
+
+// ============================================================================
+// DISPLAY SCHEDULE LOGIC
+// ============================================================================
+
+DisplayMode calculateScheduleMode(int hour) {
+    if (!scheduleConfig.enabled) return MODE_DAYTIME;
+
+    // Handle the case where dim_end wraps past midnight
+    // Daytime: daytime_start to daytime_end
+    // Dim: daytime_end to dim_end
+    // Off: dim_end to daytime_start (wraps through midnight)
+
+    if (hour >= scheduleConfig.daytime_start && hour < scheduleConfig.daytime_end) {
+        return MODE_DAYTIME;
+    }
+    if (hour >= scheduleConfig.daytime_end && hour < scheduleConfig.dim_end) {
+        return MODE_DIM;
+    }
+    return MODE_OFF;
+}
+
+void applyDisplayMode(DisplayMode mode) {
+    if (mode == currentDisplayMode) return;
+
+    currentDisplayMode = mode;
+    switch (mode) {
+        case MODE_DAYTIME:
+            setBacklightBrightness(scheduleConfig.daytime_brightness);
+            Serial.println("Display mode: DAYTIME");
+            break;
+        case MODE_DIM:
+            setBacklightBrightness(scheduleConfig.dim_brightness);
+            Serial.println("Display mode: DIM");
+            break;
+        case MODE_OFF:
+            setBacklightBrightness(0);
+            Serial.println("Display mode: OFF (API polling paused)");
+            break;
+    }
+}
+
+DisplayMode getCurrentDisplayMode() { return currentDisplayMode; }
+
+void reapplyCurrentBrightness() {
+    // Force reapply brightness for current mode (used after schedule config changes)
+    switch (currentDisplayMode) {
+        case MODE_DAYTIME:
+            setBacklightBrightness(scheduleConfig.daytime_brightness);
+            break;
+        case MODE_DIM:
+            setBacklightBrightness(scheduleConfig.dim_brightness);
+            break;
+        case MODE_OFF:
+            setBacklightBrightness(0);
+            break;
+    }
+    Serial.printf("Reapplied brightness for mode %d\n", currentDisplayMode);
+}
+
+// ============================================================================
+// WATCHDOG TIMER FUNCTIONS
+// ============================================================================
+
+void setupWatchdog() {
+    // Initialize watchdog with 5 minute timeout (panic on timeout = true)
+    esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+    esp_task_wdt_add(NULL);  // Add current task (loop task) to watchdog
+    watchdogEnabled = true;
+    Serial.printf("Watchdog enabled: %lu second timeout\n", WDT_TIMEOUT_SECONDS);
+}
+
+void feedWatchdog() {
+    if (watchdogEnabled) {
+        esp_task_wdt_reset();
+    }
+}
+
+void disableWatchdog() {
+    if (watchdogEnabled) {
+        esp_task_wdt_delete(NULL);
+        watchdogEnabled = false;
+        Serial.println("Watchdog disabled");
+    }
+}
+
 // Update arrow animation - call every frame for smooth movement
 bool updateArrowAnimation(float deltaMs) {
     if (!ui_arrow) return false;
@@ -581,6 +787,20 @@ void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 // ============================================================================
 // SETUP FUNCTIONS
 // ============================================================================
+
+// ============================================================================
+// PWM BACKLIGHT FUNCTIONS
+// ============================================================================
+
+void setBacklightBrightness(uint8_t percent) {
+    // Simple on/off control - this backlight doesn't support PWM dimming
+    if (percent > 0) {
+        digitalWrite(GFX_BL, HIGH);
+    } else {
+        digitalWrite(GFX_BL, LOW);
+    }
+    Serial.printf("Backlight %s\n", percent > 0 ? "ON" : "OFF");
+}
 
 void setupDisplay() {
     Serial.println("Initializing display...");
@@ -845,6 +1065,12 @@ void showFlightUI() {
     }
     lv_scr_load(ui_screen);
     firstApiFetch = true;  // Trigger immediate fetch when switching to flight UI
+
+    // Enable watchdog when transitioning to flight tracker mode
+    if (!watchdogEnabled) {
+        setupWatchdog();
+    }
+
     Serial.println("Showing flight tracker UI");
 }
 
@@ -1495,8 +1721,9 @@ void setup() {
     setupLVGL();
     setupTouch();
 
-    // Load location from preferences before creating UI
+    // Load configuration from preferences before creating UI
     loadLocation();
+    loadScheduleConfig();
 
     // Create the appropriate screen based on location configuration
     if (locationConfigured) {
@@ -1508,6 +1735,12 @@ void setup() {
     lv_timer_handler();
 
     setupWiFi();
+
+    // Initialize NTP after WiFi is connected
+    if (WiFi.status() == WL_CONNECTED) {
+        setupNTP();
+    }
+
     webServer.begin();
 
     // Now that WiFi is up, create setup screen if needed
@@ -1515,6 +1748,11 @@ void setup() {
         createSetupScreen();
         lv_scr_load(ui_setup_screen);
         lv_timer_handler();  // Force render after loading setup screen
+    }
+
+    // Enable watchdog timer when location is configured (API fetching active)
+    if (locationConfigured) {
+        setupWatchdog();
     }
 
     Serial.println("\n========================================");
@@ -1540,10 +1778,39 @@ void loop() {
     lv_timer_handler();
     processSerial();
 
+    // Feed the watchdog to prevent reset (must be called at least every 5 minutes)
+    feedWatchdog();
+
+    // Check NTP sync status (once per minute)
+    if (WiFi.status() == WL_CONNECTED && now - lastNtpCheck > 60000) {
+        bool wasSynced = ntpSynced;
+        ntpSynced = isNtpSynced();
+        if (!wasSynced && ntpSynced) {
+            Serial.printf("NTP synced! Current time: %s\n", getCurrentTimeString().c_str());
+        }
+        lastNtpCheck = now;
+    }
+
+    // Update display schedule (every second when NTP is synced)
+    if (ntpSynced && scheduleConfig.enabled && now - lastScheduleCheck > 1000) {
+        DisplayMode newMode = calculateScheduleMode(getCurrentHour());
+        if (newMode != currentDisplayMode) {
+            applyDisplayMode(newMode);
+        }
+        lastScheduleCheck = now;
+    }
+
     // Only run flight tracker logic when location is configured
     if (!locationConfigured) {
         ElegantOTA.loop();
         delay(5);
+        return;
+    }
+
+    // Skip flight tracker when screen is off (pause API polling)
+    if (currentDisplayMode == MODE_OFF) {
+        ElegantOTA.loop();
+        delay(50);  // Longer delay when screen is off to reduce power
         return;
     }
 
