@@ -13,6 +13,7 @@
 #include <math.h>
 #include <time.h>
 #include <esp_task_wdt.h>
+#include "rom/cache.h"
 
 // Custom Space Grotesk fonts (compiled separately)
 LV_FONT_DECLARE(space_grotesk_bold_48);
@@ -775,16 +776,33 @@ bool updateSplitFlapAnimation() {
 // LVGL CALLBACKS
 // ============================================================================
 
+// Cached framebuffer pointer for direct flush (avoids virtual dispatch per frame)
+static uint16_t *hw_framebuffer = nullptr;
+static volatile uint32_t flushCount = 0;  // Count actual display flushes for FPS
+
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
     uint32_t w = (area->x2 - area->x1 + 1);
     uint32_t h = (area->y2 - area->y1 + 1);
+    uint16_t *src = (uint16_t *)&color_p->full;
+    uint16_t *dst = hw_framebuffer + ((int32_t)area->y1 * TFT_WIDTH) + area->x1;
 
-#if (LV_COLOR_16_SWAP != 0)
-    gfx->draw16bitBeRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
-#else
-    gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
-#endif
+    if (w == TFT_WIDTH) {
+        // Full-width flush - single contiguous memcpy
+        memcpy(dst, src, w * h * sizeof(uint16_t));
+    } else {
+        // Partial width - memcpy per row
+        for (uint32_t y = 0; y < h; y++) {
+            memcpy(dst, src, w * sizeof(uint16_t));
+            src += w;
+            dst += TFT_WIDTH;
+        }
+    }
 
+    // Flush CPU cache so RGB LCD DMA sees updated pixels
+    Cache_WriteBack_Addr((uint32_t)(hw_framebuffer + (int32_t)area->y1 * TFT_WIDTH),
+                         TFT_WIDTH * h * sizeof(uint16_t));
+
+    flushCount++;
     lv_disp_flush_ready(disp);
 }
 
@@ -838,7 +856,10 @@ void setupDisplay() {
     gfx->fillScreen(BLACK);
     pinMode(GFX_BL, OUTPUT);
     digitalWrite(GFX_BL, HIGH);
-    Serial.println("Display initialized");
+
+    // Cache framebuffer pointer for direct flush (avoids virtual dispatch)
+    hw_framebuffer = gfx->getFramebuffer();
+    Serial.printf("Display initialized (framebuffer: %p)\n", hw_framebuffer);
 }
 
 void setupLVGL() {
@@ -1194,6 +1215,11 @@ void updateUI() {
 // API selection: 0 = OpenSky, 1 = airplanes.live
 int currentApi = 1; // Start with airplanes.live (less aggressive rate limiting)
 unsigned long apiSwitchTime = 0;
+
+// Background API fetch task (runs HTTP on core 0, keeps render loop smooth)
+static TaskHandle_t apiTaskHandle = nullptr;
+static volatile bool apiInProgress = false;
+static volatile bool apiResultReady = false;
 
 bool fetchAirplanesLive() {
     if (WiFi.status() != WL_CONNECTED) {
@@ -1735,6 +1761,43 @@ void processSerial() {
 }
 
 // ============================================================================
+// BACKGROUND API TASK (runs on core 0, separate from render loop)
+// ============================================================================
+
+void apiTask(void *param) {
+    for (;;) {
+        // Block until main loop requests a fetch
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        bool success = false;
+
+        if (currentApi == 0) {
+            success = fetchOpenSkyData();
+            if (!success && rateLimitBackoff > 0) {
+                currentApi = 1;
+                apiSwitchTime = millis();
+                logPrint("Switching to airplanes.live\n");
+                success = fetchAirplanesLive();
+            }
+        } else {
+            success = fetchAirplanesLive();
+            if (millis() - apiSwitchTime > 300000) {
+                currentApi = 0;
+                rateLimitBackoff = 0;
+            }
+        }
+
+        if (success) {
+            fetchAircraftInfo(nearestPlane.icao24);
+            fetchCallsignRoute(nearestPlane.callsign);
+        }
+
+        apiResultReady = true;
+        apiInProgress = false;
+    }
+}
+
+// ============================================================================
 // ARDUINO SETUP & LOOP
 // ============================================================================
 
@@ -1776,6 +1839,10 @@ void setup() {
 
     webServer.begin();
 
+    // Start background API task on core 0 (WiFi core) - keeps render loop on core 1 smooth
+    xTaskCreatePinnedToCore(apiTask, "api_fetch", 16384, NULL, 1, &apiTaskHandle, 0);
+    Serial.println("Background API task started on core 0");
+
     // Now that WiFi is up, create setup screen if needed
     if (!locationConfigured) {
         createSetupScreen();
@@ -1811,12 +1878,14 @@ void loop() {
     lv_timer_handler();
     processSerial();
 
-    // FPS tracking
+    // FPS tracking (measures actual display flushes, not loop iterations)
     fpsFrameCount++;
     if (now - fpsLastReport >= FPS_REPORT_INTERVAL) {
-        currentFps = (float)fpsFrameCount * 1000.0f / (now - fpsLastReport);
-        Serial.printf("FPS: %.1f (avg frame time: %.1fms)\n", currentFps, 1000.0f / currentFps);
+        float loopRate = (float)fpsFrameCount * 1000.0f / (now - fpsLastReport);
+        currentFps = (float)flushCount * 1000.0f / (now - fpsLastReport);
+        Serial.printf("FPS: %.1f render, %.0f loop/s\n", currentFps, loopRate);
         fpsFrameCount = 0;
+        flushCount = 0;
         fpsLastReport = now;
     }
 
@@ -1878,55 +1947,22 @@ void loop() {
         updateMiniArrows(elapsedSeconds);
     }
 
-    // Fetch aircraft data periodically (or immediately on first run)
+    // Check for API results from background task (non-blocking)
+    if (apiResultReady) {
+        apiResultReady = false;
+        lastPositionUpdate = now;
+        updateUI();
+    }
+
+    // Trigger background API fetch if needed
     unsigned long effectiveInterval = API_UPDATE_INTERVAL + rateLimitBackoff;
     bool shouldFetch = firstApiFetch || (now - lastApiUpdate > effectiveInterval);
 
-    // Debug: log fetch decision every 10 seconds
-    static unsigned long lastFetchDebug = 0;
-    if (now - lastFetchDebug > 10000) {
-        Serial.printf("API check: WiFi=%d, shouldFetch=%d, firstFetch=%d, elapsed=%lu/%lu\n",
-            WiFi.status() == WL_CONNECTED, shouldFetch, firstApiFetch,
-            now - lastApiUpdate, effectiveInterval);
-        lastFetchDebug = now;
-    }
-
-    if (WiFi.status() == WL_CONNECTED && shouldFetch) {
+    if (!apiInProgress && WiFi.status() == WL_CONNECTED && shouldFetch) {
         lastApiUpdate = now;
         firstApiFetch = false;
-        if (rateLimitBackoff > 0) {
-            Serial.printf("Backoff expired, retrying API...\n");
-        }
-
-        bool success = false;
-
-        // Try primary API, switch on failure
-        if (currentApi == 0) {
-            success = fetchOpenSkyData();
-            if (!success && rateLimitBackoff > 0) {
-                // OpenSky rate limited, try airplanes.live
-                currentApi = 1;
-                apiSwitchTime = millis();
-                logPrint("Switching to airplanes.live\n");
-                success = fetchAirplanesLive();
-            }
-        } else {
-            success = fetchAirplanesLive();
-            // Try switching back to OpenSky after 5 minutes
-            if (millis() - apiSwitchTime > 300000) {
-                currentApi = 0;
-                rateLimitBackoff = 0;
-            }
-        }
-
-        if (success) {
-            // Record when we got fresh position data
-            lastPositionUpdate = now;
-            // Try to get additional aircraft info
-            fetchAircraftInfo(nearestPlane.icao24);
-            fetchCallsignRoute(nearestPlane.callsign);
-        }
-        updateUI();
+        apiInProgress = true;
+        xTaskNotifyGive(apiTaskHandle);
     }
 
     ElegantOTA.loop();

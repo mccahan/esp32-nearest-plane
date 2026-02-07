@@ -99,6 +99,7 @@ void DisplayWebServer::setupRoutes() {
 
     // API: Get device info
     server.on("/api/info", HTTP_GET, [](AsyncWebServerRequest *request) {
+        extern float currentFps;
         StaticJsonDocument<512> doc;
         doc["chip_model"] = ESP.getChipModel();
         doc["chip_revision"] = ESP.getChipRevision();
@@ -108,6 +109,7 @@ void DisplayWebServer::setupRoutes() {
         doc["free_psram"] = ESP.getFreePsram();
         doc["total_psram"] = ESP.getPsramSize();
         doc["uptime_seconds"] = millis() / 1000;
+        doc["fps"] = serialized(String(currentFps, 1));
         doc["ip_address"] = WiFi.localIP().toString();
         doc["mac_address"] = WiFi.macAddress();
 
