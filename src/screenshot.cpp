@@ -1,5 +1,4 @@
 #include "screenshot.h"
-#include <lvgl.h>
 
 #define SCREEN_WIDTH 480
 #define SCREEN_HEIGHT 480
@@ -65,28 +64,13 @@ bool captureScreenshot() {
         return false;
     }
 
-    // Get LVGL display and screen buffer
-    lv_disp_t* disp = lv_disp_get_default();
-    if (!disp) {
-        Serial.println("No display found");
+    // Read directly from the hardware display framebuffer
+    // This always contains the complete, current frame as shown on screen
+    uint16_t* fb = gfx->getFramebuffer();
+    if (!fb) {
+        Serial.println("No hardware framebuffer available");
         return false;
     }
-
-    // Get the active draw buffer (contains current display state)
-    lv_disp_draw_buf_t* draw_buf = lv_disp_get_draw_buf(disp);
-    if (!draw_buf || !draw_buf->buf_act) {
-        Serial.println("No active buffer");
-        return false;
-    }
-
-    // Validate buffer size
-    uint32_t expected_size = SCREEN_WIDTH * SCREEN_HEIGHT;
-    if (draw_buf->size < expected_size) {
-        Serial.printf("Buffer too small: %u < %u\n", draw_buf->size, expected_size);
-        return false;
-    }
-
-    lv_color_t* buf = (lv_color_t*)draw_buf->buf_act;
 
     // Calculate sizes
     uint32_t row_size = ((SCREEN_WIDTH * 3 + 3) / 4) * 4;  // BMP rows must be multiple of 4 bytes
@@ -120,7 +104,7 @@ bool captureScreenshot() {
     for (int y = SCREEN_HEIGHT - 1; y >= 0; y--) {
         for (int x = 0; x < SCREEN_WIDTH; x++) {
             int pixel_index = y * SCREEN_WIDTH + x;
-            uint16_t rgb565 = buf[pixel_index].full;
+            uint16_t rgb565 = fb[pixel_index];
 
             uint8_t r, g, b;
             rgb565_to_rgb888(rgb565, &r, &g, &b);

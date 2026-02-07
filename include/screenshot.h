@@ -2,6 +2,10 @@
 #define SCREENSHOT_H
 
 #include <Arduino.h>
+#include <display/Arduino_ST7701_RGBPanel.h>
+
+// Hardware display - defined in main.cpp
+extern Arduino_ST7701_RGBPanel *gfx;
 
 // Initialize screenshot storage in PSRAM
 void initScreenshot();

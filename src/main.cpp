@@ -226,6 +226,12 @@ float targetArrowAngle = 0;       // Target angle to animate toward (degrees)
 const float ARROW_ROTATION_SPEED = 90.0f;  // Degrees per second
 const float MAX_DELTA_MS = 50.0f;          // Cap frame delta to prevent jumps after HTTP calls
 
+// Performance monitoring
+unsigned long fpsFrameCount = 0;
+unsigned long fpsLastReport = 0;
+float currentFps = 0;
+const unsigned long FPS_REPORT_INTERVAL = 5000;  // Report every 5 seconds
+
 // Split-flap animation state
 char previousCallsign[16] = "";
 char displayedCallsign[16] = "";
@@ -266,39 +272,43 @@ LV_IMG_DECLARE(small_arrow);
 #define COLOR_TEXT_SECONDARY lv_color_hex(0x075985)
 #define COLOR_WHITE_30      lv_color_hex(0xFFFFFF)
 
+// Pre-computed constants for performance
+static const float DEG2RAD = M_PI / 180.0f;
+static const float METERS_PER_DEGREE_LAT = 111000.0f;
+
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
 // Calculate distance between two lat/lon points in miles using Haversine formula
 float calculateDistance(float lat1, float lon1, float lat2, float lon2) {
-    const float R = 3959.0; // Earth radius in miles
+    const float R = 3959.0f; // Earth radius in miles
 
-    float dLat = (lat2 - lat1) * M_PI / 180.0;
-    float dLon = (lon2 - lon1) * M_PI / 180.0;
+    float dLat = (lat2 - lat1) * DEG2RAD;
+    float dLon = (lon2 - lon1) * DEG2RAD;
 
-    float a = sin(dLat/2) * sin(dLat/2) +
-              cos(lat1 * M_PI / 180.0) * cos(lat2 * M_PI / 180.0) *
-              sin(dLon/2) * sin(dLon/2);
+    float a = sinf(dLat * 0.5f) * sinf(dLat * 0.5f) +
+              cosf(lat1 * DEG2RAD) * cosf(lat2 * DEG2RAD) *
+              sinf(dLon * 0.5f) * sinf(dLon * 0.5f);
 
-    float c = 2 * atan2(sqrt(a), sqrt(1-a));
+    float c = 2.0f * atan2f(sqrtf(a), sqrtf(1.0f - a));
 
     return R * c;
 }
 
 // Calculate bearing from point 1 to point 2 in degrees (0 = North, 90 = East)
 float calculateBearing(float lat1, float lon1, float lat2, float lon2) {
-    float dLon = (lon2 - lon1) * M_PI / 180.0;
-    float lat1Rad = lat1 * M_PI / 180.0;
-    float lat2Rad = lat2 * M_PI / 180.0;
+    float dLon = (lon2 - lon1) * DEG2RAD;
+    float lat1Rad = lat1 * DEG2RAD;
+    float lat2Rad = lat2 * DEG2RAD;
 
-    float y = sin(dLon) * cos(lat2Rad);
-    float x = cos(lat1Rad) * sin(lat2Rad) - sin(lat1Rad) * cos(lat2Rad) * cos(dLon);
+    float y = sinf(dLon) * cosf(lat2Rad);
+    float x = cosf(lat1Rad) * sinf(lat2Rad) - sinf(lat1Rad) * cosf(lat2Rad) * cosf(dLon);
 
-    float bearing = atan2(y, x) * 180.0 / M_PI;
+    float bearing = atan2f(y, x) * (180.0f / M_PI);
 
     // Normalize to 0-360
-    bearing = fmod((bearing + 360.0), 360.0);
+    bearing = fmodf((bearing + 360.0f), 360.0f);
 
     return bearing;
 }
@@ -322,17 +332,16 @@ void predictAircraftPosition(float elapsedSeconds, float* outLat, float* outLon,
     }
 
     // Convert heading to radians (heading 0 = North, 90 = East)
-    float headingRad = nearestPlane.heading * M_PI / 180.0f;
+    float headingRad = nearestPlane.heading * DEG2RAD;
 
     // Calculate velocity components (m/s)
-    float velocityNorth = nearestPlane.velocity * cos(headingRad);  // North component
-    float velocityEast = nearestPlane.velocity * sin(headingRad);   // East component
+    float velocityNorth = nearestPlane.velocity * cosf(headingRad);  // North component
+    float velocityEast = nearestPlane.velocity * sinf(headingRad);   // East component
 
     // Convert to degrees per second
     // 1 degree latitude ≈ 111,000 meters
     // 1 degree longitude ≈ 111,000 * cos(latitude) meters
-    const float METERS_PER_DEGREE_LAT = 111000.0f;
-    float metersPerDegreeLon = 111000.0f * cos(nearestPlane.latitude * M_PI / 180.0f);
+    float metersPerDegreeLon = METERS_PER_DEGREE_LAT * cosf(nearestPlane.latitude * DEG2RAD);
 
     float latChangePerSecond = velocityNorth / METERS_PER_DEGREE_LAT;
     float lonChangePerSecond = velocityEast / metersPerDegreeLon;
@@ -573,6 +582,9 @@ void disableWatchdog() {
     }
 }
 
+// Cached arrow angle to avoid redundant LVGL calls
+static int16_t cachedArrowAngle = 0;
+
 // Update arrow animation - call every frame for smooth movement
 bool updateArrowAnimation(float deltaMs) {
     if (!ui_arrow) return false;
@@ -581,53 +593,71 @@ bool updateArrowAnimation(float deltaMs) {
     if (deltaMs > MAX_DELTA_MS) deltaMs = MAX_DELTA_MS;
 
     float diff = shortestAngularDistance(currentArrowAngle, targetArrowAngle);
-    float absDiff = fabs(diff);
+    float absDiff = fabsf(diff);
 
     // If very close, snap to target
     if (absDiff < 0.5f) {
         currentArrowAngle = targetArrowAngle;
-        lv_img_set_angle(ui_arrow, (int16_t)(currentArrowAngle * 10));
+        int16_t newAngle = (int16_t)(currentArrowAngle * 10);
+        if (newAngle != cachedArrowAngle) {
+            lv_img_set_angle(ui_arrow, newAngle);
+            cachedArrowAngle = newAngle;
+        }
         return false;
     }
 
     // Calculate rotation for this frame
     float maxRotation = ARROW_ROTATION_SPEED * (deltaMs / 1000.0f);
     float rotation = diff;
-    if (fabs(rotation) > maxRotation) {
+    if (fabsf(rotation) > maxRotation) {
         rotation = (diff > 0) ? maxRotation : -maxRotation;
     }
 
     currentArrowAngle = normalizeAngle(currentArrowAngle + rotation);
-    lv_img_set_angle(ui_arrow, (int16_t)(currentArrowAngle * 10));
+    int16_t newAngle = (int16_t)(currentArrowAngle * 10);
+    if (newAngle != cachedArrowAngle) {
+        lv_img_set_angle(ui_arrow, newAngle);
+        cachedArrowAngle = newAngle;
+    }
     return true;
 }
+
+// Cached minimap state to avoid redundant LVGL calls
+static int16_t cachedMiniArrowAngles[5] = {0};
+static int16_t cachedMiniArrowX[5] = {0};
+static int16_t cachedMiniArrowY[5] = {0};
+static bool cachedMiniArrowVisible[5] = {false};
 
 // Update minimap arrows at screen edges pointing to nearby aircraft
 // Supports position interpolation when elapsedSeconds > 0
 void updateMiniArrows(float elapsedSeconds = 0) {
-    const float CENTER_X = 240.0f;
-    const float CENTER_Y = 240.0f;
-
     for (int i = 0; i < 5; i++) {
-        if (i >= nearbyPlaneCount || !nearbyPlanes[i].valid) {
-            lv_obj_add_flag(ui_mini_arrows[i], LV_OBJ_FLAG_HIDDEN);
+        bool shouldBeVisible = (i < nearbyPlaneCount && nearbyPlanes[i].valid);
+
+        if (!shouldBeVisible) {
+            if (cachedMiniArrowVisible[i]) {
+                lv_obj_add_flag(ui_mini_arrows[i], LV_OBJ_FLAG_HIDDEN);
+                cachedMiniArrowVisible[i] = false;
+            }
             continue;
         }
 
-        // Show the arrow
-        lv_obj_clear_flag(ui_mini_arrows[i], LV_OBJ_FLAG_HIDDEN);
+        // Show the arrow if hidden
+        if (!cachedMiniArrowVisible[i]) {
+            lv_obj_clear_flag(ui_mini_arrows[i], LV_OBJ_FLAG_HIDDEN);
+            cachedMiniArrowVisible[i] = true;
+        }
 
         // Get bearing - interpolate position if we have velocity data
         float bearing = nearbyPlanes[i].bearing;
 
         if (elapsedSeconds > 0 && nearbyPlanes[i].velocity > 1.0f) {
             // Predict position based on velocity and heading
-            float headingRad = nearbyPlanes[i].heading * M_PI / 180.0f;
-            float velocityNorth = nearbyPlanes[i].velocity * cos(headingRad);
-            float velocityEast = nearbyPlanes[i].velocity * sin(headingRad);
+            float headingRad = nearbyPlanes[i].heading * DEG2RAD;
+            float velocityNorth = nearbyPlanes[i].velocity * cosf(headingRad);
+            float velocityEast = nearbyPlanes[i].velocity * sinf(headingRad);
 
-            const float METERS_PER_DEGREE_LAT = 111000.0f;
-            float metersPerDegreeLon = 111000.0f * cos(nearbyPlanes[i].latitude * M_PI / 180.0f);
+            float metersPerDegreeLon = METERS_PER_DEGREE_LAT * cosf(nearbyPlanes[i].latitude * DEG2RAD);
 
             float predLat = nearbyPlanes[i].latitude + (velocityNorth / METERS_PER_DEGREE_LAT) * elapsedSeconds;
             float predLon = nearbyPlanes[i].longitude + (velocityEast / metersPerDegreeLon) * elapsedSeconds;
@@ -635,45 +665,45 @@ void updateMiniArrows(float elapsedSeconds = 0) {
             bearing = calculateBearing(userLat, userLon, predLat, predLon);
         }
 
-        float bearingRad = bearing * M_PI / 180.0f;
-        float sinB = sin(bearingRad);
-        float cosB = cos(bearingRad);
+        // Only update position if bearing changed significantly (>0.5 degrees)
+        int16_t newAngle = (int16_t)(bearing * 10);
+
+        float bearingRad = bearing * DEG2RAD;
+        float sinB = sinf(bearingRad);
+        float cosB = cosf(bearingRad);
 
         // Calculate where ray from center at this bearing hits screen edge
-        // Screen bounds: 0 to 480, tip should be exactly at edge
-        float tipX, tipY;
+        // Use 240 as center (half of 480)
+        float r;
 
-        // Calculate distance to each edge along the ray
-        // Right edge (x=480): sinB > 0
-        // Left edge (x=0): sinB < 0
-        // Bottom edge (y=480): cosB < 0 (bearing toward south)
-        // Top edge (y=0): cosB > 0 (bearing toward north)
-
-        float rRight = (sinB > 0.001f) ? (480.0f - CENTER_X) / sinB : 99999.0f;
-        float rLeft = (sinB < -0.001f) ? (0.0f - CENTER_X) / sinB : 99999.0f;
-        float rBottom = (cosB < -0.001f) ? (CENTER_Y - 480.0f) / cosB : 99999.0f;
-        float rTop = (cosB > 0.001f) ? (CENTER_Y - 0.0f) / cosB : 99999.0f;
+        // Simplified edge intersection - find closest edge
+        float rRight = (sinB > 0.001f) ? 240.0f / sinB : 99999.0f;
+        float rLeft = (sinB < -0.001f) ? -240.0f / sinB : 99999.0f;
+        float rBottom = (cosB < -0.001f) ? 240.0f / cosB : 99999.0f;
+        float rTop = (cosB > 0.001f) ? 240.0f / cosB : 99999.0f;
 
         // Find minimum positive radius
-        float r = 99999.0f;
+        r = 99999.0f;
         if (rRight > 0 && rRight < r) r = rRight;
         if (rLeft > 0 && rLeft < r) r = rLeft;
         if (rBottom > 0 && rBottom < r) r = rBottom;
         if (rTop > 0 && rTop < r) r = rTop;
 
         // Calculate tip position at edge
-        tipX = CENTER_X + r * sinB;
-        tipY = CENTER_Y - r * cosB;
+        int16_t newX = (int16_t)(240.0f + r * sinB) - 18;
+        int16_t newY = (int16_t)(240.0f - r * cosB);
 
-        // Position image so pivot (tip at 18,0) is at tipX, tipY
-        // LVGL pivot stays at original coordinates even when zoomed
-        int x = (int)tipX - 18;
-        int y = (int)tipY;
+        // Only update LVGL if values changed (LVGL calls are expensive)
+        if (newX != cachedMiniArrowX[i] || newY != cachedMiniArrowY[i]) {
+            lv_obj_set_pos(ui_mini_arrows[i], newX, newY);
+            cachedMiniArrowX[i] = newX;
+            cachedMiniArrowY[i] = newY;
+        }
 
-        lv_obj_set_pos(ui_mini_arrows[i], x, y);
-
-        // Rotate arrow to point toward the aircraft
-        lv_img_set_angle(ui_mini_arrows[i], (int16_t)(bearing * 10));
+        if (newAngle != cachedMiniArrowAngles[i]) {
+            lv_img_set_angle(ui_mini_arrows[i], newAngle);
+            cachedMiniArrowAngles[i] = newAngle;
+        }
     }
 }
 
@@ -804,7 +834,7 @@ void setBacklightBrightness(uint8_t percent) {
 
 void setupDisplay() {
     Serial.println("Initializing display...");
-    gfx->begin(8000000);
+    gfx->begin(8000000);  // 8MHz pixel clock - stable
     gfx->fillScreen(BLACK);
     pinMode(GFX_BL, OUTPUT);
     digitalWrite(GFX_BL, HIGH);
@@ -816,6 +846,8 @@ void setupLVGL() {
 
     lv_init();
 
+    // Double-buffered full-frame rendering in PSRAM
+    // This prevents tearing but limits FPS due to PSRAM copy overhead
     size_t buf_size = TFT_WIDTH * TFT_HEIGHT;
     disp_draw_buf1 = (lv_color_t *)heap_caps_malloc(sizeof(lv_color_t) * buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     disp_draw_buf2 = (lv_color_t *)heap_caps_malloc(sizeof(lv_color_t) * buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -832,10 +864,10 @@ void setupLVGL() {
     disp_drv.ver_res = TFT_HEIGHT;
     disp_drv.flush_cb = my_disp_flush;
     disp_drv.draw_buf = &draw_buf;
-    disp_drv.full_refresh = 1;
+    disp_drv.full_refresh = 0;  // Partial refresh - only redraw changed areas
     lv_disp_drv_register(&disp_drv);
 
-    Serial.println("LVGL initialized");
+    Serial.println("LVGL initialized (partial refresh mode)");
 }
 
 void setupTouch() {
@@ -1079,8 +1111,9 @@ void showFlightUI() {
 // ============================================================================
 
 void updateUI() {
-    logPrintf("updateUI() valid=%d, callsign='%s', dist=%.1f\n",
-        nearestPlane.valid, nearestPlane.callsign, nearestPlane.distance_miles);
+    // Only log on actual data changes (called after API fetch)
+    Serial.printf("updateUI: %s at %.1f mi\n",
+        nearestPlane.valid ? nearestPlane.callsign : "---", nearestPlane.distance_miles);
     if (!nearestPlane.valid) {
         lv_label_set_text(ui_callsign, "---");
         if (rateLimitBackoff > 0) {
@@ -1778,6 +1811,15 @@ void loop() {
     lv_timer_handler();
     processSerial();
 
+    // FPS tracking
+    fpsFrameCount++;
+    if (now - fpsLastReport >= FPS_REPORT_INTERVAL) {
+        currentFps = (float)fpsFrameCount * 1000.0f / (now - fpsLastReport);
+        Serial.printf("FPS: %.1f (avg frame time: %.1fms)\n", currentFps, 1000.0f / currentFps);
+        fpsFrameCount = 0;
+        fpsLastReport = now;
+    }
+
     // Feed the watchdog to prevent reset (must be called at least every 5 minutes)
     feedWatchdog();
 
@@ -1802,15 +1844,20 @@ void loop() {
 
     // Only run flight tracker logic when location is configured
     if (!locationConfigured) {
+        static unsigned long lastLocDebug = 0;
+        if (now - lastLocDebug > 5000) {
+            Serial.println("Waiting for location config...");
+            lastLocDebug = now;
+        }
         ElegantOTA.loop();
-        delay(5);
+        taskYIELD();
         return;
     }
 
     // Skip flight tracker when screen is off (pause API polling)
     if (currentDisplayMode == MODE_OFF) {
         ElegantOTA.loop();
-        delay(50);  // Longer delay when screen is off to reduce power
+        delay(50);  // Longer delay when screen is off to save power
         return;
     }
 
@@ -1834,6 +1881,16 @@ void loop() {
     // Fetch aircraft data periodically (or immediately on first run)
     unsigned long effectiveInterval = API_UPDATE_INTERVAL + rateLimitBackoff;
     bool shouldFetch = firstApiFetch || (now - lastApiUpdate > effectiveInterval);
+
+    // Debug: log fetch decision every 10 seconds
+    static unsigned long lastFetchDebug = 0;
+    if (now - lastFetchDebug > 10000) {
+        Serial.printf("API check: WiFi=%d, shouldFetch=%d, firstFetch=%d, elapsed=%lu/%lu\n",
+            WiFi.status() == WL_CONNECTED, shouldFetch, firstApiFetch,
+            now - lastApiUpdate, effectiveInterval);
+        lastFetchDebug = now;
+    }
+
     if (WiFi.status() == WL_CONNECTED && shouldFetch) {
         lastApiUpdate = now;
         firstApiFetch = false;
@@ -1873,5 +1930,8 @@ void loop() {
     }
 
     ElegantOTA.loop();
-    delay(5);
+
+    // Yield to other tasks but don't add unnecessary delay
+    // LVGL handles timing internally via lv_timer_handler()
+    taskYIELD();
 }

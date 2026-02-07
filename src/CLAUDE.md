@@ -7,6 +7,5 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #1713 | 1:33 PM | 🔴 | Adjusted default dim brightness level from 30% to 50% | ~289 |
 | #1656 | 11:27 AM | ✅ | Generated small_arrow.c asset with RGB565+Alpha format for LVGL | ~334 |
 </claude-mem-context>

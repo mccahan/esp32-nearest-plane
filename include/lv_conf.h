@@ -22,10 +22,10 @@
 #define LV_USE_MEM_MONITOR 0
 
 /* Input device settings */
-#define LV_INDEV_DEF_READ_PERIOD 30
+#define LV_INDEV_DEF_READ_PERIOD 10
 
-/* Drawing */
-#define LV_DISP_DEF_REFR_PERIOD 30
+/* Drawing - target 60fps */
+#define LV_DISP_DEF_REFR_PERIOD 16
 #define LV_USE_GPU_STM32_DMA2D 0
 
 /* Themes */
