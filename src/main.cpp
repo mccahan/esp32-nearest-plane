@@ -41,6 +41,9 @@ float userLat = 0;
 float userLon = 0;
 bool locationConfigured = false;
 
+// Filter setting: hide private/anonymous aircraft (where registration == callsign)
+bool hidePrivatePlanes = false;
+
 // Bounding box for API query (degrees around user location)
 #define BBOX_RANGE 2.0
 
@@ -414,6 +417,29 @@ void saveLocation(float lat, float lon) {
 float getUserLat() { return userLat; }
 float getUserLon() { return userLon; }
 bool isLocationConfigured() { return locationConfigured; }
+
+// ============================================================================
+// FILTER SETTINGS
+// ============================================================================
+
+Preferences filter_prefs;
+
+void loadFilterSettings() {
+    filter_prefs.begin("filters", true);  // read-only
+    hidePrivatePlanes = filter_prefs.getBool("hide_priv", false);
+    filter_prefs.end();
+    Serial.printf("Filter settings loaded: hidePrivate=%d\n", hidePrivatePlanes);
+}
+
+void saveFilterSettings() {
+    filter_prefs.begin("filters", false);  // read-write
+    filter_prefs.putBool("hide_priv", hidePrivatePlanes);
+    filter_prefs.end();
+    Serial.printf("Filter settings saved: hidePrivate=%d\n", hidePrivatePlanes);
+}
+
+bool getHidePrivatePlanes() { return hidePrivatePlanes; }
+void setHidePrivatePlanes(bool val) { hidePrivatePlanes = val; }
 
 // ============================================================================
 // SCHEDULE MANAGEMENT
@@ -1332,6 +1358,28 @@ bool fetchAirplanesLive() {
         float lon = ac["lon"].as<float>();
         float dist = calculateDistance(userLat, userLon, lat, lon);
 
+        // Filter private/anonymous aircraft (registration == callsign)
+        // unless very close (< 0.25 miles)
+        if (hidePrivatePlanes && dist >= 0.25f) {
+            const char* reg = ac["r"];
+            const char* flight = ac["flight"];
+            if (reg && flight) {
+                // Trim trailing spaces from flight
+                char trimmedFlight[16];
+                strncpy(trimmedFlight, flight, sizeof(trimmedFlight) - 1);
+                trimmedFlight[sizeof(trimmedFlight) - 1] = '\0';
+                int len = strlen(trimmedFlight);
+                while (len > 0 && trimmedFlight[len-1] == ' ') {
+                    trimmedFlight[--len] = '\0';
+                }
+                if (strcmp(reg, trimmedFlight) == 0) {
+                    skippedGround++;
+                    acIndex++;
+                    continue;
+                }
+            }
+        }
+
         // Insert into sorted list if closer than any current candidate
         for (int i = 0; i < 6; i++) {
             if (dist < nearest6[i].distance) {
@@ -1820,6 +1868,7 @@ void setup() {
     // Load configuration from preferences before creating UI
     loadLocation();
     loadScheduleConfig();
+    loadFilterSettings();
 
     // Create the appropriate screen based on location configuration
     if (locationConfigured) {

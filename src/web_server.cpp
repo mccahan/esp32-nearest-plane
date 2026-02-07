@@ -42,6 +42,11 @@ enum DisplayMode { MODE_DAYTIME, MODE_DIM, MODE_OFF };
 extern DisplayMode getCurrentDisplayMode();
 extern void reapplyCurrentBrightness();
 
+// External filter settings (defined in main.cpp)
+extern bool getHidePrivatePlanes();
+extern void setHidePrivatePlanes(bool val);
+extern void saveFilterSettings();
+
 // Global instance
 DisplayWebServer webServer;
 
@@ -508,6 +513,46 @@ void DisplayWebServer::setupRoutes() {
         }
     );
 
+    // API: Get filter settings
+    server.on("/api/filters", HTTP_GET, [](AsyncWebServerRequest *request) {
+        StaticJsonDocument<128> doc;
+        doc["hide_private"] = getHidePrivatePlanes();
+
+        String response;
+        serializeJson(doc, response);
+        request->send(200, "application/json", response);
+    });
+
+    // API: Set filter settings (with body handler for POST data)
+    server.on("/api/filters", HTTP_POST,
+        [](AsyncWebServerRequest *request) {
+            // Response is sent after body is processed
+        },
+        NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            StaticJsonDocument<128> doc;
+            DeserializationError error = deserializeJson(doc, data, len);
+
+            if (error) {
+                request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+                return;
+            }
+
+            if (doc.containsKey("hide_private")) {
+                setHidePrivatePlanes(doc["hide_private"].as<bool>());
+            }
+
+            saveFilterSettings();
+
+            StaticJsonDocument<64> response;
+            response["success"] = true;
+
+            String responseStr;
+            serializeJson(response, responseStr);
+            request->send(200, "application/json", responseStr);
+        }
+    );
+
 }
 
 String DisplayWebServer::getIndexPage() {
@@ -632,6 +677,20 @@ String DisplayWebServer::getIndexPage() {
                 </div>
             </div>
             <button class="btn" onclick="saveLocation()">Save Location</button>
+        </div>
+
+        <div class="card">
+            <h2>Aircraft Filters</h2>
+            <div id="filter-status" style="margin-bottom: 15px;"></div>
+            <div class="form-group">
+                <label style="display: flex; align-items: center; gap: 10px; cursor: pointer;">
+                    <input type="checkbox" id="filter-hide-private" style="width: auto;" onchange="saveFilters()">
+                    <span>Hide private aircraft</span>
+                </label>
+                <p style="color: #666; margin-top: 5px; font-size: 0.8em;">
+                    Hides planes where the registration matches the callsign (typically private/anonymous flights). Aircraft within 1/4 mile are always shown.
+                </p>
+            </div>
         </div>
 
         <div class="card">
@@ -1089,11 +1148,46 @@ String DisplayWebServer::getIndexPage() {
             }
         }
 
+        // Filter functions
+        async function loadFilterSettings() {
+            try {
+                const response = await fetch('/api/filters');
+                const data = await response.json();
+                document.getElementById('filter-hide-private').checked = data.hide_private;
+            } catch (e) {
+                console.error('Failed to load filter settings:', e);
+            }
+        }
+
+        async function saveFilters() {
+            const config = {
+                hide_private: document.getElementById('filter-hide-private').checked
+            };
+
+            try {
+                const response = await fetch('/api/filters', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    const status = document.getElementById('filter-status');
+                    status.innerHTML = '<span class="status status-success">Saved!</span>';
+                    setTimeout(() => { status.innerHTML = ''; }, 2000);
+                }
+            } catch (e) {
+                console.error('Failed to save filters:', e);
+            }
+        }
+
         // Load data on page load
         loadDeviceInfo();
         loadWifiStatus();
         initLocationMap();
         loadLocationStatus();
+        loadFilterSettings();
         initScheduleSelects();
         loadScheduleStatus();
         setInterval(loadDeviceInfo, 5000);
