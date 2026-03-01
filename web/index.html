@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 Nearest Plane - Web Installer</title>
+  <script
+    type="module"
+    src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"
+  ></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+    .container {
+      max-width: 600px;
+      width: 100%;
+    }
+    h1 {
+      font-size: 1.75rem;
+      margin-bottom: 0.5rem;
+    }
+    .subtitle {
+      color: var(--muted);
+      margin-bottom: 2rem;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+    .card h2 {
+      font-size: 1.1rem;
+      margin-bottom: 0.75rem;
+    }
+    .card p, .card li {
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .card ol {
+      padding-left: 1.25rem;
+    }
+    .card li {
+      margin-bottom: 0.4rem;
+    }
+    .install-box {
+      text-align: center;
+      padding: 2rem 1.5rem;
+    }
+    esp-web-install-button {
+      --esp-tools-button-color: var(--accent);
+    }
+    esp-web-install-button button {
+      font-size: 1.1rem;
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      border: none;
+      background: var(--accent);
+      color: var(--bg);
+      font-weight: 600;
+      cursor: pointer;
+    }
+    esp-web-install-button button:hover {
+      opacity: 0.9;
+    }
+    .note {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-top: 1rem;
+    }
+    code {
+      background: var(--bg);
+      padding: 0.15rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>ESP32 Nearest Plane</h1>
+    <p class="subtitle">ADS-B flight tracker for Guition ESP32-S3-4848S040</p>
+
+    <div class="card install-box">
+      <h2>Install Firmware</h2>
+      <p style="margin-bottom: 1.5rem;">
+        Connect your ESP32-S3 board via USB and click the button below.
+      </p>
+      <esp-web-install-button manifest="manifest.json">
+        <button slot="activate">Install Nearest Plane</button>
+        <span slot="unsupported">
+          Your browser does not support Web Serial.<br>
+          Use Chrome or Edge on desktop.
+        </span>
+        <span slot="not-allowed">
+          Serial access is not allowed in this context.
+        </span>
+      </esp-web-install-button>
+      <p class="note">Requires Chrome or Edge. The device will be erased during first install.</p>
+    </div>
+
+    <div class="card">
+      <h2>After Installation</h2>
+      <ol>
+        <li>The device starts in AP mode &mdash; connect to the <code>ESP32-Display</code> WiFi network</li>
+        <li>Open <code>192.168.4.1</code> in your browser to configure WiFi and location</li>
+        <li>The device reboots and begins tracking nearby aircraft</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h2>What You Need</h2>
+      <ol>
+        <li>Guition ESP32-S3-4848S040 (480x480 display)</li>
+        <li>USB-C cable (data, not charge-only)</li>
+        <li>WiFi network with internet access</li>
+      </ol>
+    </div>
+  </div>
+</body>
+</html>

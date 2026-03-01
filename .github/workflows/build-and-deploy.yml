@@ -1,0 +1,89 @@
+name: Build and Deploy Web Installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini', 'partitions.csv') }}
+          restore-keys: pio-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        run: pio run -e esp32s3
+
+      - name: Prepare deploy directory
+        run: |
+          mkdir -p deploy
+          cp .pio/build/esp32s3/firmware.bin deploy/
+          cp .pio/build/esp32s3/bootloader.bin deploy/
+          cp .pio/build/esp32s3/partitions.bin deploy/
+
+          # boot_app0.bin (OTA data init) is in the framework package
+          find ~/.platformio/packages -name boot_app0.bin -path "*/partitions/*" \
+            -exec cp {} deploy/ \;
+
+          cp web/index.html deploy/
+
+      - name: Generate manifest
+        run: |
+          VERSION="${GITHUB_SHA::7}"
+          cat > deploy/manifest.json << EOF
+          {
+            "name": "ESP32 Nearest Plane",
+            "version": "${VERSION}",
+            "builds": [
+              {
+                "chipFamily": "ESP32-S3",
+                "parts": [
+                  { "path": "bootloader.bin", "offset": 0 },
+                  { "path": "partitions.bin", "offset": 32768 },
+                  { "path": "boot_app0.bin", "offset": 57344 },
+                  { "path": "firmware.bin", "offset": 65536 }
+                ]
+              }
+            ]
+          }
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: deploy
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
