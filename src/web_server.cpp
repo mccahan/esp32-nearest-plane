@@ -284,9 +284,23 @@ void DisplayWebServer::setupRoutes() {
         request->send(200, "application/json", response);
     });
 
-    // API: Scan WiFi networks
+    // API: Scan WiFi networks (async to avoid watchdog timeout)
+    // First call starts scan and returns {"scanning":true}
+    // Client polls until results are ready
     server.on("/api/wifi/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
-        int n = WiFi.scanNetworks();
+        int n = WiFi.scanComplete();
+        if (n == WIFI_SCAN_FAILED) {
+            // No scan in progress — start one (async=true)
+            WiFi.scanNetworks(true);
+            request->send(200, "application/json", "{\"scanning\":true}");
+            return;
+        }
+        if (n == WIFI_SCAN_RUNNING) {
+            request->send(200, "application/json", "{\"scanning\":true}");
+            return;
+        }
+
+        // Scan complete — return results
         StaticJsonDocument<2048> doc;
         JsonArray networks = doc.createNestedArray("networks");
 
@@ -924,8 +938,13 @@ String DisplayWebServer::getIndexPage() {
             list.innerHTML = '<div style="padding: 10px; color: #888;">Scanning...</div>';
 
             try {
-                const response = await fetch('/api/wifi/scan');
-                const data = await response.json();
+                // Poll until scan completes (async scan avoids device watchdog)
+                let data;
+                do {
+                    const response = await fetch('/api/wifi/scan');
+                    data = await response.json();
+                    if (data.scanning) await new Promise(r => setTimeout(r, 1000));
+                } while (data.scanning);
 
                 if (data.networks.length === 0) {
                     list.innerHTML = '<div style="padding: 10px; color: #888;">No networks found</div>';
