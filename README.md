@@ -8,7 +8,7 @@ Based on [esp32-display-claude-base](https://github.com/mccahan/esp32-display-cl
 
 ## Features
 
-- **Live ADS-B tracking** via the [airplanes.live](https://airplanes.live) API, refreshed every 30 seconds
+- **Live ADS-B tracking** via the [airplanes.live](https://airplanes.live) API or a local receiver, refreshed every 10-30 seconds
 - **Compass arrow** with smooth rotation pointing toward the nearest aircraft
 - **Split-flap animation** for callsign transitions
 - **Route lookup** (origin/destination airports) via adsbdb.com
@@ -54,6 +54,19 @@ On first boot the device creates a WiFi access point named **ESP32-Display**. Co
 2. **Location** - set latitude/longitude for distance and bearing calculations
 3. **Display schedule** - optionally set on/off times for the backlight
 4. **Aircraft filters** - hide private planes (where registration matches callsign)
+
+### Local ADS-B Receiver
+
+If you run a local ADS-B receiver (dump1090, readsb, or tar1090) on your network, the device will automatically detect it and use it instead of the cloud API. This gives faster updates (every 10 seconds vs 30) and works without internet.
+
+The device probes these endpoints at startup and every 60 seconds:
+
+- `http://adsbexchange.local/tar1090/data/aircraft.json`
+- `http://adsbexchange.local/data/aircraft.json`
+
+If the local receiver goes offline, it falls back to the cloud API automatically. The current data source ("local" or "cloud") is shown in the `/api/info` endpoint.
+
+### Default WiFi
 
 You can also create `include/secrets.h` with default WiFi credentials:
 
