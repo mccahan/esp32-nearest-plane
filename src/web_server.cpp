@@ -269,12 +269,12 @@ void DisplayWebServer::setupRoutes() {
     server.on("/api/wifi/status", HTTP_GET, [](AsyncWebServerRequest *request) {
         StaticJsonDocument<256> doc;
         doc["connected"] = (WiFi.status() == WL_CONNECTED);
-        doc["mode"] = (WiFi.getMode() == WIFI_AP) ? "ap" : "station";
+        doc["mode"] = apModeActive ? "ap" : "station";
         doc["ssid"] = WiFi.SSID();
         doc["ip"] = WiFi.localIP().toString();
         doc["rssi"] = WiFi.RSSI();
 
-        if (WiFi.getMode() == WIFI_AP) {
+        if (apModeActive) {
             doc["ap_ip"] = WiFi.softAPIP().toString();
             doc["ap_ssid"] = "ESP32-Display";
         }

@@ -981,7 +981,7 @@ void setupWiFi() {
     }
 
     Serial.println("Starting AP mode...");
-    WiFi.mode(WIFI_AP);
+    WiFi.mode(WIFI_AP_STA);  // AP+STA so WiFi scanning and connecting work
     WiFi.softAP("ESP32-Display", "configure");
     apModeActive = true;
 
@@ -1105,7 +1105,7 @@ void createSetupScreen() {
     lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 90);
 
     // Build QR code content based on WiFi mode
-    bool isAP = (WiFi.getMode() == WIFI_AP);
+    bool isAP = apModeActive;
     String qrData;
     if (isAP) {
         // WiFi QR code so phones auto-join the AP network
@@ -1898,7 +1898,7 @@ void handleSerialCommand(const String& cmd) {
             Serial.println(WiFi.localIP().toString());
             Serial.print("SSID:");
             Serial.println(WiFi.SSID());
-        } else if (WiFi.getMode() == WIFI_AP) {
+        } else if (apModeActive) {
             Serial.println("WIFI:AP_MODE");
             Serial.print("IP:");
             Serial.println(WiFi.softAPIP().toString());
