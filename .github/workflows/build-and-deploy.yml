@@ -49,7 +49,10 @@ jobs:
           find ~/.platformio/packages -name boot_app0.bin -path "*/partitions/*" \
             -exec cp {} deploy/ \;
 
-          cp web/index.html deploy/
+          # Inject build version into index.html for cache-busting and display
+          VERSION="${GITHUB_SHA::7}"
+          sed "s|manifest.json|manifest.json?v=${VERSION}|g; s|{{VERSION}}|${VERSION}|g" \
+            web/index.html > deploy/index.html
 
       - name: Generate manifest
         run: |

@@ -116,13 +116,14 @@
         </span>
       </esp-web-install-button>
       <p class="note">Requires Chrome or Edge. The device will be erased during first install.</p>
+      <p class="note">Build: <code>{{VERSION}}</code></p>
     </div>
 
     <div class="card">
       <h2>After Installation</h2>
       <ol>
-        <li>The device starts in AP mode &mdash; connect to the <code>ESP32-Display</code> WiFi network</li>
-        <li>Open <code>192.168.4.1</code> in your browser to configure WiFi and location</li>
+        <li>The device starts in AP mode &mdash; scan the QR code on screen or join the <code>ESP32-Display</code> WiFi network (password: <code>configure</code>)</li>
+        <li>A setup page opens automatically (or visit <code>192.168.4.1</code>)</li>
         <li>The device reboots and begins tracking nearby aircraft</li>
       </ol>
     </div>
