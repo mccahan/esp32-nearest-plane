@@ -10,6 +10,7 @@
 #include "web_server.h"
 #include "screenshot.h"
 #include <ElegantOTA.h>
+#include <DNSServer.h>
 #include <math.h>
 #include <time.h>
 #include <esp_task_wdt.h>
@@ -137,6 +138,8 @@ volatile unsigned long simulated_touch_start = 0;
 const unsigned long SIMULATED_TOUCH_DURATION = 150;
 
 Preferences wifi_prefs;
+DNSServer dnsServer;
+bool apModeActive = false;
 
 // ============================================================================
 // SERIAL LOG BUFFER (for remote debugging)
@@ -980,7 +983,11 @@ void setupWiFi() {
     Serial.println("Starting AP mode...");
     WiFi.mode(WIFI_AP);
     WiFi.softAP("ESP32-Display", "configure");
-    Serial.printf("AP: ESP32-Display, IP: %s\n", WiFi.softAPIP().toString().c_str());
+    apModeActive = true;
+
+    // Start DNS server for captive portal (redirect all domains to our IP)
+    dnsServer.start(53, "*", WiFi.softAPIP());
+    Serial.printf("AP: ESP32-Display, IP: %s (captive portal active)\n", WiFi.softAPIP().toString().c_str());
 }
 
 // ============================================================================
@@ -1097,15 +1104,20 @@ void createSetupScreen() {
     lv_obj_set_style_text_color(subtitle, COLOR_TEXT_SECONDARY, 0);
     lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 90);
 
-    // Build the URL for the QR code
-    String ip = WiFi.status() == WL_CONNECTED ?
-                WiFi.localIP().toString() :
-                WiFi.softAPIP().toString();
-    String url = "http://" + ip + "/";
+    // Build QR code content based on WiFi mode
+    bool isAP = (WiFi.getMode() == WIFI_AP);
+    String qrData;
+    if (isAP) {
+        // WiFi QR code so phones auto-join the AP network
+        qrData = "WIFI:T:WPA;S:ESP32-Display;P:configure;;";
+    } else {
+        // HTTP URL when already on a network
+        qrData = "http://" + WiFi.localIP().toString() + "/";
+    }
 
     // QR code (200x200 pixels)
     ui_qrcode = lv_qrcode_create(ui_setup_screen, 200, lv_color_hex(0x0c4a6e), lv_color_white());
-    lv_qrcode_update(ui_qrcode, url.c_str(), url.length());
+    lv_qrcode_update(ui_qrcode, qrData.c_str(), qrData.length());
     lv_obj_align(ui_qrcode, LV_ALIGN_CENTER, 0, -10);
 
     // Add white border around QR code
@@ -1114,16 +1126,24 @@ void createSetupScreen() {
 
     // Instructions
     lv_obj_t *instr1 = lv_label_create(ui_setup_screen);
-    lv_label_set_text(instr1, "Scan to configure your location");
+    if (isAP) {
+        lv_label_set_text(instr1, "Scan to join WiFi network");
+    } else {
+        lv_label_set_text(instr1, "Scan to configure your location");
+    }
     lv_obj_set_style_text_font(instr1, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(instr1, COLOR_TEXT_PRIMARY, 0);
     lv_obj_align(instr1, LV_ALIGN_CENTER, 0, 130);
 
-    // IP address display
+    // Secondary instruction / IP display
     lv_obj_t *ipLabel = lv_label_create(ui_setup_screen);
-    char ipText[64];
-    snprintf(ipText, sizeof(ipText), "Or visit: %s", ip.c_str());
-    lv_label_set_text(ipLabel, ipText);
+    if (isAP) {
+        lv_label_set_text(ipLabel, "Password: configure");
+    } else {
+        char ipText[64];
+        snprintf(ipText, sizeof(ipText), "Or visit: %s", WiFi.localIP().toString().c_str());
+        lv_label_set_text(ipLabel, ipText);
+    }
     lv_obj_set_style_text_font(ipLabel, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ipLabel, COLOR_TEXT_SECONDARY, 0);
     lv_obj_align(ipLabel, LV_ALIGN_CENTER, 0, 160);
@@ -2078,6 +2098,11 @@ void loop() {
             applyDisplayMode(newMode);
         }
         lastScheduleCheck = now;
+    }
+
+    // Process captive portal DNS in AP mode
+    if (apModeActive) {
+        dnsServer.processNextRequest();
     }
 
     // Only run flight tracker logic when location is configured

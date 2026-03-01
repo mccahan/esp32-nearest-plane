@@ -52,6 +52,9 @@ extern bool isLocalReceiverAvailable();
 extern const char* getLocalReceiverUrl();
 extern bool wasLastFetchLocal();
 
+// External AP mode state (defined in main.cpp)
+extern bool apModeActive;
+
 // Global instance
 DisplayWebServer webServer;
 
@@ -563,6 +566,15 @@ void DisplayWebServer::setupRoutes() {
         }
     );
 
+    // Captive portal: redirect all unknown requests to root in AP mode
+    server.onNotFound([this](AsyncWebServerRequest *request) {
+        if (apModeActive) {
+            request->redirect("http://" + WiFi.softAPIP().toString() + "/");
+        } else {
+            request->send(404, "text/plain", "Not found");
+        }
+    });
+
 }
 
 String DisplayWebServer::getIndexPage() {
@@ -573,8 +585,8 @@ String DisplayWebServer::getIndexPage() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ESP32 Display Controller</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" onerror="window._leafletFailed=true"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" onerror="window._leafletFailed=true"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -712,7 +724,7 @@ String DisplayWebServer::getIndexPage() {
             <div class="screenshot-container" id="screenshot-container"></div>
         </div>
 
-        <div class="card">
+        <div class="card" id="wifi-card">
             <h2>WiFi Configuration</h2>
             <div id="wifi-status" style="margin-bottom: 15px;"></div>
             <button class="btn btn-secondary" onclick="scanNetworks()">Scan Networks</button>
@@ -969,6 +981,13 @@ String DisplayWebServer::getIndexPage() {
         let locationMarker = null;
 
         function initLocationMap() {
+            if (window._leafletFailed || typeof L === 'undefined') {
+                // Leaflet unavailable (AP mode / no internet) - hide the map
+                const mapEl = document.getElementById('location-map');
+                if (mapEl) mapEl.style.display = 'none';
+                return;
+            }
+
             // Default to center of US if no location configured
             const defaultLat = 39.8283;
             const defaultLon = -98.5795;
@@ -1192,6 +1211,27 @@ String DisplayWebServer::getIndexPage() {
             }
         }
 
+        // Reorder page for AP mode: WiFi config should be first
+        async function setupPageForMode() {
+            try {
+                const resp = await fetch('/api/wifi/status');
+                const data = await resp.json();
+                if (data.mode === 'ap') {
+                    const container = document.querySelector('.container');
+                    const wifiCard = document.getElementById('wifi-card');
+                    const locationCard = document.getElementById('location-card');
+                    // Move WiFi card right after h1 (before all other cards)
+                    if (wifiCard && container.children[1]) {
+                        container.insertBefore(wifiCard, container.children[1]);
+                    }
+                    // Move location card right after WiFi card
+                    if (locationCard && wifiCard) {
+                        wifiCard.after(locationCard);
+                    }
+                }
+            } catch(e) {}
+        }
+
         // Load data on page load
         loadDeviceInfo();
         loadWifiStatus();
@@ -1200,6 +1240,7 @@ String DisplayWebServer::getIndexPage() {
         loadFilterSettings();
         initScheduleSelects();
         loadScheduleStatus();
+        setupPageForMode();
         setInterval(loadDeviceInfo, 5000);
         setInterval(loadWifiStatus, 10000);
         setInterval(loadScheduleStatus, 5000);  // Update time display
