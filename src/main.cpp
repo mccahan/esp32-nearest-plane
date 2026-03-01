@@ -442,6 +442,20 @@ bool getHidePrivatePlanes() { return hidePrivatePlanes; }
 void setHidePrivatePlanes(bool val) { hidePrivatePlanes = val; }
 
 // ============================================================================
+// LOCAL ADS-B RECEIVER (auto-detect)
+// ============================================================================
+
+bool localReceiverAvailable = false;
+unsigned long lastLocalProbe = 0;
+const unsigned long LOCAL_PROBE_INTERVAL = 60000;  // re-probe every 60s on failure
+char localReceiverUrl[128] = "";
+bool lastFetchWasLocal = false;  // tracks which source provided last successful data
+
+bool isLocalReceiverAvailable() { return localReceiverAvailable; }
+const char* getLocalReceiverUrl() { return localReceiverUrl; }
+bool wasLastFetchLocal() { return lastFetchWasLocal; }
+
+// ============================================================================
 // SCHEDULE MANAGEMENT
 // ============================================================================
 
@@ -1247,64 +1261,11 @@ static TaskHandle_t apiTaskHandle = nullptr;
 static volatile bool apiInProgress = false;
 static volatile bool apiResultReady = false;
 
-bool fetchAirplanesLive() {
-    if (WiFi.status() != WL_CONNECTED) {
-        return false;
-    }
+// ============================================================================
+// SHARED AIRCRAFT JSON PARSER
+// ============================================================================
 
-    HTTPClient http;
-
-    // airplanes.live API: /v2/point/{lat}/{lon}/{radius_nm}
-    char url[128];
-    snprintf(url, sizeof(url),
-        "https://api.airplanes.live/v2/point/%.4f/%.4f/%d",
-        userLat, userLon, currentSearchRadiusMiles
-    );
-
-    logPrintf("Fetching (airplanes.live): %s\n", url);
-
-    http.begin(url);
-    http.setTimeout(10000);
-
-    logPrint("Sending request...\n");
-    int httpCode = http.GET();
-    logPrintf("Response code: %d\n", httpCode);
-
-    if (httpCode != HTTP_CODE_OK) {
-        logPrintf("airplanes.live HTTP error: %d\n", httpCode);
-        if (httpCode == 429) {
-            // Switch back to OpenSky
-            currentApi = 0;
-            apiSwitchTime = millis();
-            logPrint("airplanes.live rate limited, switching to OpenSky\n");
-        }
-        http.end();
-        return false;
-    }
-
-    logPrint("Getting response...\n");
-    String payload = http.getString();
-    http.end();
-    logPrintf("Response length: %d bytes\n", payload.length());
-
-    DynamicJsonDocument doc(98304);  // 96KB for large responses
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (error) {
-        logPrintf("JSON parse error: %s\n", error.c_str());
-        return false;
-    }
-
-    JsonArray aircraft = doc["ac"];
-    if (aircraft.isNull() || aircraft.size() == 0) {
-        logPrint("No aircraft found\n");
-        nearestPlane.valid = false;
-        nearbyPlaneCount = 0;  // Clear minimap data
-        return false;
-    }
-
-    logPrintf("Found %d aircraft (airplanes.live)\n", (int)aircraft.size());
-
+bool parseAircraftArray(JsonArray& aircraft, bool adjustRadius) {
     // Two-pass approach to avoid stack overflow:
     // Pass 1: Find indices and distances of 6 nearest aircraft
     // Pass 2: Extract full data only for those 6
@@ -1483,35 +1444,174 @@ bool fetchAirplanesLive() {
     }
     logPrintf("Minimap: %d nearby aircraft\n", nearbyPlaneCount);
 
-    // Adjust search radius based on aircraft count
-    int totalAircraft = aircraft.size();
-    int previousRadius = currentSearchRadiusMiles;
+    // Adjust search radius based on aircraft count (only for cloud APIs with radius queries)
+    if (adjustRadius) {
+        int totalAircraft = aircraft.size();
+        int previousRadius = currentSearchRadiusMiles;
 
-    if (totalAircraft < TARGET_AIRCRAFT_COUNT && currentSearchRadiusMiles < MAX_SEARCH_RADIUS) {
-        // Not enough aircraft - increase radius
-        // Increase by 50% or at least 10 miles, whichever is larger
-        int increase = currentSearchRadiusMiles / 2;
-        if (increase < 10) increase = 10;
-        currentSearchRadiusMiles += increase;
-        if (currentSearchRadiusMiles > MAX_SEARCH_RADIUS) {
-            currentSearchRadiusMiles = MAX_SEARCH_RADIUS;
+        if (totalAircraft < TARGET_AIRCRAFT_COUNT && currentSearchRadiusMiles < MAX_SEARCH_RADIUS) {
+            int increase = currentSearchRadiusMiles / 2;
+            if (increase < 10) increase = 10;
+            currentSearchRadiusMiles += increase;
+            if (currentSearchRadiusMiles > MAX_SEARCH_RADIUS) {
+                currentSearchRadiusMiles = MAX_SEARCH_RADIUS;
+            }
+            logPrintf("Radius %d->%d mi (found %d, need %d)\n",
+                previousRadius, currentSearchRadiusMiles, totalAircraft, TARGET_AIRCRAFT_COUNT);
+        } else if (totalAircraft > REDUCE_THRESHOLD && currentSearchRadiusMiles > MIN_SEARCH_RADIUS) {
+            int decrease = currentSearchRadiusMiles / 5;
+            if (decrease < 5) decrease = 5;
+            currentSearchRadiusMiles -= decrease;
+            if (currentSearchRadiusMiles < MIN_SEARCH_RADIUS) {
+                currentSearchRadiusMiles = MIN_SEARCH_RADIUS;
+            }
+            logPrintf("Radius %d->%d mi (found %d, reducing)\n",
+                previousRadius, currentSearchRadiusMiles, totalAircraft);
         }
-        logPrintf("Radius %d->%d mi (found %d, need %d)\n",
-            previousRadius, currentSearchRadiusMiles, totalAircraft, TARGET_AIRCRAFT_COUNT);
-    } else if (totalAircraft > REDUCE_THRESHOLD && currentSearchRadiusMiles > MIN_SEARCH_RADIUS) {
-        // Too many aircraft - decrease radius to reduce data transfer
-        // Decrease by 20% (gentler reduction)
-        int decrease = currentSearchRadiusMiles / 5;
-        if (decrease < 5) decrease = 5;
-        currentSearchRadiusMiles -= decrease;
-        if (currentSearchRadiusMiles < MIN_SEARCH_RADIUS) {
-            currentSearchRadiusMiles = MIN_SEARCH_RADIUS;
-        }
-        logPrintf("Radius %d->%d mi (found %d, reducing)\n",
-            previousRadius, currentSearchRadiusMiles, totalAircraft);
     }
 
     return nearestPlane.valid;
+}
+
+// ============================================================================
+// LOCAL ADS-B RECEIVER FUNCTIONS
+// ============================================================================
+
+void probeLocalReceiver() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    const char* endpoints[] = {
+        "http://adsbexchange.local/tar1090/data/aircraft.json",
+        "http://adsbexchange.local/data/aircraft.json"
+    };
+
+    HTTPClient http;
+    for (int i = 0; i < 2; i++) {
+        logPrintf("Probing local receiver: %s\n", endpoints[i]);
+        http.begin(endpoints[i]);
+        http.setTimeout(2000);
+        int code = http.GET();
+        if (code == HTTP_CODE_OK) {
+            strncpy(localReceiverUrl, endpoints[i], sizeof(localReceiverUrl) - 1);
+            localReceiverAvailable = true;
+            logPrintf("Local receiver found: %s\n", localReceiverUrl);
+            http.end();
+            return;
+        }
+        http.end();
+    }
+
+    localReceiverAvailable = false;
+    lastLocalProbe = millis();
+    logPrint("No local receiver found\n");
+}
+
+bool fetchLocalReceiver() {
+    if (WiFi.status() != WL_CONNECTED || !localReceiverAvailable) return false;
+
+    HTTPClient http;
+    logPrintf("Fetching (local): %s\n", localReceiverUrl);
+    http.begin(localReceiverUrl);
+    http.setTimeout(3000);
+
+    int httpCode = http.GET();
+    if (httpCode != HTTP_CODE_OK) {
+        logPrintf("Local receiver HTTP error: %d\n", httpCode);
+        localReceiverAvailable = false;
+        lastLocalProbe = millis();
+        http.end();
+        return false;
+    }
+
+    String payload = http.getString();
+    http.end();
+    logPrintf("Local response: %d bytes\n", payload.length());
+
+    DynamicJsonDocument doc(98304);
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+        logPrintf("Local JSON parse error: %s\n", error.c_str());
+        localReceiverAvailable = false;
+        lastLocalProbe = millis();
+        return false;
+    }
+
+    // Local receivers use "aircraft", airplanes.live uses "ac"
+    JsonArray aircraft = doc["aircraft"];
+    if (aircraft.isNull()) aircraft = doc["ac"];
+    if (aircraft.isNull() || aircraft.size() == 0) {
+        logPrint("No aircraft in local data\n");
+        nearestPlane.valid = false;
+        nearbyPlaneCount = 0;
+        return false;
+    }
+
+    logPrintf("Found %d aircraft (local receiver)\n", (int)aircraft.size());
+    return parseAircraftArray(aircraft, false);
+}
+
+// ============================================================================
+// CLOUD API FUNCTIONS
+// ============================================================================
+
+bool fetchAirplanesLive() {
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+
+    HTTPClient http;
+
+    // airplanes.live API: /v2/point/{lat}/{lon}/{radius_nm}
+    char url[128];
+    snprintf(url, sizeof(url),
+        "https://api.airplanes.live/v2/point/%.4f/%.4f/%d",
+        userLat, userLon, currentSearchRadiusMiles
+    );
+
+    logPrintf("Fetching (airplanes.live): %s\n", url);
+
+    http.begin(url);
+    http.setTimeout(10000);
+
+    logPrint("Sending request...\n");
+    int httpCode = http.GET();
+    logPrintf("Response code: %d\n", httpCode);
+
+    if (httpCode != HTTP_CODE_OK) {
+        logPrintf("airplanes.live HTTP error: %d\n", httpCode);
+        if (httpCode == 429) {
+            // Switch back to OpenSky
+            currentApi = 0;
+            apiSwitchTime = millis();
+            logPrint("airplanes.live rate limited, switching to OpenSky\n");
+        }
+        http.end();
+        return false;
+    }
+
+    logPrint("Getting response...\n");
+    String payload = http.getString();
+    http.end();
+    logPrintf("Response length: %d bytes\n", payload.length());
+
+    DynamicJsonDocument doc(98304);  // 96KB for large responses
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (error) {
+        logPrintf("JSON parse error: %s\n", error.c_str());
+        return false;
+    }
+
+    JsonArray aircraft = doc["ac"];
+    if (aircraft.isNull() || aircraft.size() == 0) {
+        logPrint("No aircraft found\n");
+        nearestPlane.valid = false;
+        nearbyPlaneCount = 0;  // Clear minimap data
+        return false;
+    }
+
+    logPrintf("Found %d aircraft (airplanes.live)\n", (int)aircraft.size());
+    return parseAircraftArray(aircraft, true);
 }
 
 bool fetchOpenSkyData() {
@@ -1819,20 +1919,39 @@ void apiTask(void *param) {
 
         bool success = false;
 
-        if (currentApi == 0) {
-            success = fetchOpenSkyData();
-            if (!success && rateLimitBackoff > 0) {
-                currentApi = 1;
-                apiSwitchTime = millis();
-                logPrint("Switching to airplanes.live\n");
+        // Try local receiver first if available
+        if (localReceiverAvailable) {
+            success = fetchLocalReceiver();
+            if (success) lastFetchWasLocal = true;
+        }
+
+        // Re-probe periodically if local receiver not available
+        if (!localReceiverAvailable && (millis() - lastLocalProbe >= LOCAL_PROBE_INTERVAL)) {
+            probeLocalReceiver();
+            if (localReceiverAvailable) {
+                success = fetchLocalReceiver();
+                if (success) lastFetchWasLocal = true;
+            }
+        }
+
+        // Fall back to cloud APIs if local didn't work
+        if (!success) {
+            if (currentApi == 0) {
+                success = fetchOpenSkyData();
+                if (!success && rateLimitBackoff > 0) {
+                    currentApi = 1;
+                    apiSwitchTime = millis();
+                    logPrint("Switching to airplanes.live\n");
+                    success = fetchAirplanesLive();
+                }
+            } else {
                 success = fetchAirplanesLive();
+                if (millis() - apiSwitchTime > 300000) {
+                    currentApi = 0;
+                    rateLimitBackoff = 0;
+                }
             }
-        } else {
-            success = fetchAirplanesLive();
-            if (millis() - apiSwitchTime > 300000) {
-                currentApi = 0;
-                rateLimitBackoff = 0;
-            }
+            if (success) lastFetchWasLocal = false;
         }
 
         if (success) {
@@ -1884,6 +2003,7 @@ void setup() {
     // Initialize NTP after WiFi is connected
     if (WiFi.status() == WL_CONNECTED) {
         setupNTP();
+        probeLocalReceiver();
     }
 
     webServer.begin();

@@ -47,6 +47,11 @@ extern bool getHidePrivatePlanes();
 extern void setHidePrivatePlanes(bool val);
 extern void saveFilterSettings();
 
+// External local receiver state (defined in main.cpp)
+extern bool isLocalReceiverAvailable();
+extern const char* getLocalReceiverUrl();
+extern bool wasLastFetchLocal();
+
 // Global instance
 DisplayWebServer webServer;
 
@@ -117,6 +122,11 @@ void DisplayWebServer::setupRoutes() {
         doc["fps"] = serialized(String(currentFps, 1));
         doc["ip_address"] = WiFi.localIP().toString();
         doc["mac_address"] = WiFi.macAddress();
+        doc["data_source"] = wasLastFetchLocal() ? "local" : "cloud";
+        doc["local_receiver_available"] = isLocalReceiverAvailable();
+        if (isLocalReceiverAvailable()) {
+            doc["local_receiver_url"] = getLocalReceiverUrl();
+        }
 
         String response;
         serializeJson(doc, response);
