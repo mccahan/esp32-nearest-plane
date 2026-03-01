@@ -217,7 +217,8 @@ int nearbyPlaneCount = 0;
 unsigned long lastApiUpdate = 0;
 bool firstApiFetch = true;  // Flag to trigger immediate first fetch
 unsigned long lastPositionUpdate = 0;  // Timestamp when position was received (for interpolation)
-const unsigned long API_UPDATE_INTERVAL = 30000; // 30 seconds (OpenSky rate limits aggressively)
+const unsigned long API_UPDATE_INTERVAL = 30000;       // 30 seconds for cloud APIs
+const unsigned long LOCAL_API_UPDATE_INTERVAL = 10000; // 10 seconds for local receiver
 unsigned long rateLimitBackoff = 0; // Extra delay when rate limited
 
 // Dynamic search radius management
@@ -453,6 +454,7 @@ unsigned long lastLocalProbe = 0;
 const unsigned long LOCAL_PROBE_INTERVAL = 60000;  // re-probe every 60s on failure
 char localReceiverUrl[128] = "";
 bool lastFetchWasLocal = false;  // tracks which source provided last successful data
+char lastLookedUpIcao[16] = "";  // ICAO of last aircraft info lookup (avoid redundant calls)
 
 bool isLocalReceiverAvailable() { return localReceiverAvailable; }
 const char* getLocalReceiverUrl() { return localReceiverUrl; }
@@ -1974,7 +1976,9 @@ void apiTask(void *param) {
             if (success) lastFetchWasLocal = false;
         }
 
-        if (success) {
+        // Only look up aircraft info/route when the nearest plane changes
+        if (success && nearestPlane.valid && strcmp(nearestPlane.icao24, lastLookedUpIcao) != 0) {
+            strncpy(lastLookedUpIcao, nearestPlane.icao24, sizeof(lastLookedUpIcao) - 1);
             fetchAircraftInfo(nearestPlane.icao24);
             fetchCallsignRoute(nearestPlane.callsign);
         }
@@ -2149,7 +2153,8 @@ void loop() {
     }
 
     // Trigger background API fetch if needed
-    unsigned long effectiveInterval = API_UPDATE_INTERVAL + rateLimitBackoff;
+    unsigned long baseInterval = localReceiverAvailable ? LOCAL_API_UPDATE_INTERVAL : API_UPDATE_INTERVAL;
+    unsigned long effectiveInterval = baseInterval + rateLimitBackoff;
     bool shouldFetch = firstApiFetch || (now - lastApiUpdate > effectiveInterval);
 
     if (!apiInProgress && WiFi.status() == WL_CONNECTED && shouldFetch) {
