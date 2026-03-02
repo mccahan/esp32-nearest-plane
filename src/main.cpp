@@ -725,7 +725,7 @@ void updateMiniArrows(float elapsedSeconds = 0) {
         // Simplified edge intersection - find closest edge
         float rRight = (sinB > 0.001f) ? 240.0f / sinB : 99999.0f;
         float rLeft = (sinB < -0.001f) ? -240.0f / sinB : 99999.0f;
-        float rBottom = (cosB < -0.001f) ? 240.0f / cosB : 99999.0f;
+        float rBottom = (cosB < -0.001f) ? -240.0f / cosB : 99999.0f;
         float rTop = (cosB > 0.001f) ? 240.0f / cosB : 99999.0f;
 
         // Find minimum positive radius
